@@ -1,13 +1,18 @@
-"""Main BlenderBot orchestrator - ties Claude and Blender together."""
+"""Main BlenderBot orchestrator - ties Claude and Blender together.
 
-from pathlib import Path
+Supports two modes:
+- "tools" mode: Claude calls structured tools (create_object, set_material, etc.)
+  which are executed via the addon's tool system. Safer and more predictable.
+- "script" mode: Claude generates raw Python code. More flexible for complex scenes.
+"""
 
+import json
 from .blender_client import BlenderClient, BlenderResponse
 from .claude_bridge import ClaudeBridge
 
 
 class BlenderBot:
-    """High-level interface: takes user input, generates scripts via Claude, executes in Blender."""
+    """High-level interface: takes user input, processes via Claude, executes in Blender."""
 
     def __init__(
         self,
@@ -15,12 +20,28 @@ class BlenderBot:
         model: str = "claude-sonnet-4-20250514",
         blender_host: str = "127.0.0.1",
         blender_port: int = 9876,
+        mode: str = "tools",
     ):
-        self.claude = ClaudeBridge(api_key=api_key, model=model)
         self.blender = BlenderClient(host=blender_host, port=blender_port)
+        self.claude = ClaudeBridge(api_key=api_key, model=model, mode=mode)
+        self.mode = mode
+        self._tools_loaded = False
+
+    def _ensure_tools_loaded(self):
+        """Fetch tool definitions from Blender addon and pass to Claude."""
+        if self._tools_loaded or self.mode != "tools":
+            return
+
+        try:
+            tools = self.blender.get_tools()
+            if tools:
+                self.claude.set_tools(tools)
+                self._tools_loaded = True
+        except Exception:
+            # Fall back to script mode if tools can't be loaded
+            pass
 
     def is_blender_connected(self) -> bool:
-        """Check if Blender is reachable."""
         return self.blender.ping()
 
     def text_to_render(
@@ -30,34 +51,21 @@ class BlenderBot:
         output_path: str = "/tmp/blenderbot_render.png",
         **render_kwargs,
     ) -> dict:
-        """Generate a 3D scene from text and optionally render it.
+        """Generate a 3D scene from text and optionally render it."""
+        self._ensure_tools_loaded()
 
-        Args:
-            prompt: Natural language description of the 3D scene.
-            render: Whether to render the scene after creating it.
-            output_path: Where to save the rendered image/animation.
-            **render_kwargs: Additional render settings (resolution, samples, etc.)
+        result = {"prompt": prompt}
+        commands = self.claude.text_to_commands(prompt)
 
-        Returns:
-            dict with 'script', 'execution' result, and optionally 'render' result.
-        """
-        script = self.claude.text_to_script(prompt)
-        result = {"script": script}
+        if self.mode == "tools" and isinstance(commands, list):
+            result["tool_calls"] = self._execute_tool_calls(commands)
+        else:
+            exec_result = self.blender.execute(commands)
+            result["execution"] = _response_to_dict(exec_result)
 
-        exec_result = self.blender.execute(script)
-        result["execution"] = {
-            "status": exec_result.status,
-            "result": exec_result.result,
-            "error": exec_result.error,
-        }
-
-        if render and exec_result.ok:
+        if render:
             render_result = self.blender.render(output_path=output_path, **render_kwargs)
-            result["render"] = {
-                "status": render_result.status,
-                "output": output_path if render_result.ok else None,
-                "error": render_result.error,
-            }
+            result["render"] = _response_to_dict(render_result)
 
         return result
 
@@ -69,35 +77,21 @@ class BlenderBot:
         output_path: str = "/tmp/blenderbot_render.png",
         **render_kwargs,
     ) -> dict:
-        """Recreate an image as a 3D scene and optionally render it.
+        """Recreate an image as a 3D scene and optionally render it."""
+        self._ensure_tools_loaded()
 
-        Args:
-            image_path: Path to the reference image.
-            prompt: Additional instructions for Claude.
-            render: Whether to render the scene after creating it.
-            output_path: Where to save the rendered image.
-            **render_kwargs: Additional render settings.
+        result = {"image": image_path, "prompt": prompt}
+        commands = self.claude.image_to_commands(image_path, prompt)
 
-        Returns:
-            dict with 'script', 'execution' result, and optionally 'render' result.
-        """
-        script = self.claude.image_to_script(image_path, prompt)
-        result = {"script": script}
+        if self.mode == "tools" and isinstance(commands, list):
+            result["tool_calls"] = self._execute_tool_calls(commands)
+        else:
+            exec_result = self.blender.execute(commands)
+            result["execution"] = _response_to_dict(exec_result)
 
-        exec_result = self.blender.execute(script)
-        result["execution"] = {
-            "status": exec_result.status,
-            "result": exec_result.result,
-            "error": exec_result.error,
-        }
-
-        if render and exec_result.ok:
+        if render:
             render_result = self.blender.render(output_path=output_path, **render_kwargs)
-            result["render"] = {
-                "status": render_result.status,
-                "output": output_path if render_result.ok else None,
-                "error": render_result.error,
-            }
+            result["render"] = _response_to_dict(render_result)
 
         return result
 
@@ -110,49 +104,54 @@ class BlenderBot:
         animation: bool = True,
         **render_kwargs,
     ) -> dict:
-        """Recreate a video as a 3D animation and optionally render it.
+        """Recreate a video as a 3D animation and optionally render it."""
+        self._ensure_tools_loaded()
 
-        Args:
-            video_path: Path to the reference video.
-            prompt: Additional instructions for Claude.
-            render: Whether to render the animation after creating it.
-            output_path: Base path for rendered animation frames.
-            animation: Render as animation (True) or single frame (False).
-            **render_kwargs: Additional render settings.
+        result = {"video": video_path, "prompt": prompt}
+        commands = self.claude.video_to_commands(video_path, prompt)
 
-        Returns:
-            dict with 'script', 'execution' result, and optionally 'render' result.
-        """
-        script = self.claude.video_to_script(video_path, prompt)
-        result = {"script": script}
+        if self.mode == "tools" and isinstance(commands, list):
+            result["tool_calls"] = self._execute_tool_calls(commands)
+        else:
+            exec_result = self.blender.execute(commands)
+            result["execution"] = _response_to_dict(exec_result)
 
-        exec_result = self.blender.execute(script)
-        result["execution"] = {
-            "status": exec_result.status,
-            "result": exec_result.result,
-            "error": exec_result.error,
-        }
-
-        if render and exec_result.ok:
+        if render:
             render_result = self.blender.render(
-                output_path=output_path,
-                animation=animation,
-                **render_kwargs,
+                output_path=output_path, animation=animation, **render_kwargs,
             )
-            result["render"] = {
-                "status": render_result.status,
-                "output": output_path if render_result.ok else None,
-                "error": render_result.error,
-            }
+            result["render"] = _response_to_dict(render_result)
 
         return result
 
+    def _execute_tool_calls(self, tool_calls: list[dict]) -> list[dict]:
+        """Execute a list of tool calls against the Blender addon."""
+        results = []
+        for tc in tool_calls:
+            tool_name = tc["tool"]
+            tool_input = tc.get("input", {})
+            response = self.blender.call_tool(tool_name, tool_input)
+            results.append({
+                "tool": tool_name,
+                "input": tool_input,
+                "status": response.status,
+                "result": response.result,
+                "error": response.error,
+            })
+            if not response.ok:
+                print(f"Tool error [{tool_name}]: {response.error}")
+        return results
+
     def execute_raw(self, script: str) -> BlenderResponse:
-        """Execute a raw Python script in Blender (bypass Claude)."""
         return self.blender.execute(script)
 
+    def call_tool(self, tool_name: str, **kwargs) -> BlenderResponse:
+        """Call a specific tool directly."""
+        return self.blender.call_tool(tool_name, kwargs)
+
     def clear_scene(self) -> BlenderResponse:
-        """Clear all objects from the Blender scene."""
+        if self.mode == "tools":
+            return self.blender.call_tool("clear_scene", {})
         return self.blender.execute("""
 import bpy
 bpy.ops.object.select_all(action='SELECT')
@@ -161,5 +160,12 @@ result = "Scene cleared"
 """)
 
     def clear_history(self):
-        """Clear conversation history with Claude."""
         self.claude.clear_history()
+
+
+def _response_to_dict(resp: BlenderResponse) -> dict:
+    return {
+        "status": resp.status,
+        "result": resp.result,
+        "error": resp.error,
+    }

@@ -1,17 +1,21 @@
 """
-BlenderBot Addon - Receives commands from the BlenderBot server and executes them in Blender.
+BlenderBot Addon - AI-powered 3D content generation.
+
+Receives commands from the BlenderBot client and executes them in Blender
+using structured MCP-style tools (object creation, materials, modifiers, etc.)
+or raw Python scripts.
 
 Install: Edit > Preferences > Add-ons > Install, select this folder.
 """
 
 bl_info = {
-    "name": "BlenderBot Remote",
+    "name": "BlenderBot",
     "author": "BlenderBot",
-    "version": (1, 0, 0),
+    "version": (2, 0, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > BlenderBot",
-    "description": "Receive and execute commands from the BlenderBot AI assistant",
-    "category": "Interface",
+    "description": "AI-powered 3D content generation with Claude and structured tools",
+    "category": "AI",
 }
 
 import bpy
@@ -22,14 +26,14 @@ import traceback
 import queue
 from pathlib import Path
 
-
-# Thread-safe queue for commands received from the server
-_command_queue = queue.Queue()
-# Thread-safe queue for results to send back
-_result_queue = queue.Queue()
+from .timer import Timer
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 9876
+
+# Thread-safe queues for communication between socket threads and main thread
+_command_queue = queue.Queue()
+_result_queue = queue.Queue()
 
 
 class BlenderBotServer:
@@ -83,44 +87,50 @@ class BlenderBotServer:
                 break
 
     def _handle_client(self, client_socket):
-        """Handle a single client connection."""
         try:
-            client_socket.settimeout(300)  # 5 min timeout for long renders
-            data = self._recv_all(client_socket)
+            client_socket.settimeout(300)
+            data = _recv_all(client_socket)
             if not data:
                 return
 
             request = json.loads(data.decode("utf-8"))
             command_type = request.get("type", "execute")
+            timeout = request.get("timeout", 120)
 
             if command_type == "ping":
                 response = {"status": "ok", "message": "pong"}
             elif command_type == "execute":
-                # Queue the script for execution on the main thread
-                script = request.get("script", "")
-                _command_queue.put(script)
-                # Wait for result (blocks this handler thread, not the main thread)
+                _command_queue.put(("execute", request.get("script", "")))
                 try:
-                    result = _result_queue.get(timeout=request.get("timeout", 120))
-                    response = result
+                    response = _result_queue.get(timeout=timeout)
                 except queue.Empty:
                     response = {"status": "error", "error": "Execution timed out"}
+            elif command_type == "tool_call":
+                # MCP-style tool call
+                tool_name = request.get("tool")
+                tool_input = request.get("input", {})
+                _command_queue.put(("tool_call", tool_name, tool_input))
+                try:
+                    response = _result_queue.get(timeout=timeout)
+                except queue.Empty:
+                    response = {"status": "error", "error": "Tool call timed out"}
+            elif command_type == "get_tools":
+                # Return available tool definitions
+                from .tools import get_all_tool_definitions
+                response = {"status": "ok", "tools": get_all_tool_definitions()}
             elif command_type == "render":
-                # Queue a render command
                 render_settings = request.get("settings", {})
                 script = _build_render_script(render_settings)
-                _command_queue.put(script)
+                _command_queue.put(("execute", script))
                 try:
-                    result = _result_queue.get(timeout=request.get("timeout", 300))
-                    response = result
+                    response = _result_queue.get(timeout=request.get("timeout", 300))
                 except queue.Empty:
                     response = {"status": "error", "error": "Render timed out"}
             else:
-                response = {"status": "error", "error": f"Unknown command type: {command_type}"}
+                response = {"status": "error", "error": f"Unknown command: {command_type}"}
 
-            response_data = json.dumps(response).encode("utf-8")
-            length_header = len(response_data).to_bytes(4, "big")
-            client_socket.sendall(length_header + response_data)
+            response_data = json.dumps(response, default=str).encode("utf-8")
+            client_socket.sendall(len(response_data).to_bytes(4, "big") + response_data)
 
         except Exception as e:
             try:
@@ -131,26 +141,26 @@ class BlenderBotServer:
         finally:
             client_socket.close()
 
-    def _recv_all(self, sock):
-        """Receive a length-prefixed message."""
-        header = b""
-        while len(header) < 4:
-            chunk = sock.recv(4 - len(header))
-            if not chunk:
-                return None
-            header += chunk
-        msg_len = int.from_bytes(header, "big")
-        data = b""
-        while len(data) < msg_len:
-            chunk = sock.recv(min(msg_len - len(data), 65536))
-            if not chunk:
-                return None
-            data += chunk
-        return data
+
+def _recv_all(sock):
+    """Receive a length-prefixed message."""
+    header = b""
+    while len(header) < 4:
+        chunk = sock.recv(4 - len(header))
+        if not chunk:
+            return None
+        header += chunk
+    msg_len = int.from_bytes(header, "big")
+    data = b""
+    while len(data) < msg_len:
+        chunk = sock.recv(min(msg_len - len(data), 65536))
+        if not chunk:
+            return None
+        data += chunk
+    return data
 
 
 def _build_render_script(settings):
-    """Build a Blender Python script to configure and execute a render."""
     output_path = settings.get("output_path", "/tmp/blenderbot_render.png")
     resolution_x = settings.get("resolution_x", 1920)
     resolution_y = settings.get("resolution_y", 1080)
@@ -160,138 +170,55 @@ def _build_render_script(settings):
     frame_start = settings.get("frame_start", 1)
     frame_end = settings.get("frame_end", 250)
 
-    script = f"""
+    return f"""
 import bpy
-
 scene = bpy.context.scene
 scene.render.engine = '{engine}'
 scene.render.resolution_x = {resolution_x}
 scene.render.resolution_y = {resolution_y}
 scene.render.filepath = '{output_path}'
-
 if scene.render.engine == 'CYCLES':
     scene.cycles.samples = {samples}
-
 if {animation}:
     scene.frame_start = {frame_start}
     scene.frame_end = {frame_end}
     bpy.ops.render.render(animation=True)
-    result = '{output_path}'
 else:
     bpy.ops.render.render(write_still=True)
-    result = '{output_path}'
+result = '{output_path}'
 """
-    return script
-
-
-# Global server instance
-_server = None
-
-
-class BLENDERBOT_OT_start_server(bpy.types.Operator):
-    """Start the BlenderBot server"""
-    bl_idname = "blenderbot.start_server"
-    bl_label = "Start BlenderBot Server"
-
-    def execute(self, context):
-        global _server
-        prefs = context.preferences.addons[__name__].preferences
-        if _server and _server._running:
-            self.report({"WARNING"}, "Server already running")
-            return {"CANCELLED"}
-        _server = BlenderBotServer(host=prefs.host, port=prefs.port)
-        _server.start()
-        context.scene.blenderbot_running = True
-        self.report({"INFO"}, f"BlenderBot server started on {prefs.host}:{prefs.port}")
-        # Start the timer that processes queued commands
-        bpy.app.timers.register(_process_command_queue, first_interval=0.1)
-        return {"FINISHED"}
-
-
-class BLENDERBOT_OT_stop_server(bpy.types.Operator):
-    """Stop the BlenderBot server"""
-    bl_idname = "blenderbot.stop_server"
-    bl_label = "Stop BlenderBot Server"
-
-    def execute(self, context):
-        global _server
-        if _server:
-            _server.stop()
-            _server = None
-        context.scene.blenderbot_running = False
-        self.report({"INFO"}, "BlenderBot server stopped")
-        return {"FINISHED"}
-
-
-class BLENDERBOT_PT_panel(bpy.types.Panel):
-    """BlenderBot control panel in the 3D viewport sidebar"""
-    bl_label = "BlenderBot"
-    bl_idname = "BLENDERBOT_PT_panel"
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category = "BlenderBot"
-
-    def draw(self, context):
-        layout = self.layout
-        prefs = context.preferences.addons[__name__].preferences
-        running = getattr(context.scene, "blenderbot_running", False)
-
-        layout.label(text=f"Host: {prefs.host}:{prefs.port}")
-
-        if running:
-            layout.operator("blenderbot.stop_server", icon="PAUSE")
-            layout.label(text="Status: Running", icon="CHECKMARK")
-        else:
-            layout.operator("blenderbot.start_server", icon="PLAY")
-            layout.label(text="Status: Stopped", icon="X")
-
-
-class BlenderBotPreferences(bpy.types.AddonPreferences):
-    bl_idname = __name__
-
-    host: bpy.props.StringProperty(
-        name="Host",
-        default=DEFAULT_HOST,
-        description="Server host address",
-    )
-    port: bpy.props.IntProperty(
-        name="Port",
-        default=DEFAULT_PORT,
-        min=1024,
-        max=65535,
-        description="Server port",
-    )
-
-    def draw(self, context):
-        layout = self.layout
-        layout.prop(self, "host")
-        layout.prop(self, "port")
 
 
 def _process_command_queue():
-    """Timer callback that runs on the main thread to execute queued scripts."""
+    """Timer callback - processes commands on the main thread (bpy-safe)."""
     global _server
     if not _server or not _server._running:
-        return None  # Unregister timer
+        return None
 
     try:
-        script = _command_queue.get_nowait()
+        command = _command_queue.get_nowait()
     except queue.Empty:
-        return 0.1  # Check again in 100ms
+        return 0.05
 
-    # Execute the script on the main thread
-    result = _execute_script(script)
+    if command[0] == "execute":
+        script = command[1]
+        result = _execute_script(script)
+    elif command[0] == "tool_call":
+        tool_name = command[1]
+        tool_input = command[2]
+        result = _execute_tool(tool_name, tool_input)
+    else:
+        result = {"status": "error", "error": f"Unknown command type: {command[0]}"}
+
     _result_queue.put(result)
-
-    return 0.1  # Continue checking
+    return 0.05
 
 
 def _execute_script(script):
-    """Execute a Python script in the Blender context and return the result."""
+    """Execute a Python script in the Blender context."""
     namespace = {"__name__": "__blenderbot__", "bpy": bpy}
     try:
         exec(compile(script, "<blenderbot>", "exec"), namespace)
-        # Check if the script set a 'result' variable
         script_result = namespace.get("result", None)
         return {
             "status": "ok",
@@ -303,6 +230,128 @@ def _execute_script(script):
             "error": str(e),
             "traceback": traceback.format_exc(),
         }
+
+
+def _execute_tool(tool_name, tool_input):
+    """Execute a named tool with the given input on the main thread."""
+    from .tools import get_tool_executor
+
+    func = get_tool_executor(tool_name)
+    if not func:
+        return {"status": "error", "error": f"Unknown tool: {tool_name}"}
+
+    try:
+        result = func(**tool_input)
+        return {"status": "ok", "result": result}
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+        }
+
+
+# Global server instance
+_server = None
+
+
+class BLENDERBOT_OT_start_server(bpy.types.Operator):
+    """Start the BlenderBot server"""
+    bl_idname = "blenderbot.start_server"
+    bl_label = "Start Server"
+
+    def execute(self, context):
+        global _server
+        prefs = context.preferences.addons[__name__].preferences
+        if _server and _server._running:
+            self.report({"WARNING"}, "Server already running")
+            return {"CANCELLED"}
+        _server = BlenderBotServer(host=prefs.host, port=prefs.port)
+        _server.start()
+        context.scene.blenderbot_running = True
+        self.report({"INFO"}, f"BlenderBot started on {prefs.host}:{prefs.port}")
+        bpy.app.timers.register(_process_command_queue, first_interval=0.1)
+        return {"FINISHED"}
+
+
+class BLENDERBOT_OT_stop_server(bpy.types.Operator):
+    """Stop the BlenderBot server"""
+    bl_idname = "blenderbot.stop_server"
+    bl_label = "Stop Server"
+
+    def execute(self, context):
+        global _server
+        if _server:
+            _server.stop()
+            _server = None
+        context.scene.blenderbot_running = False
+        self.report({"INFO"}, "BlenderBot stopped")
+        return {"FINISHED"}
+
+
+class BLENDERBOT_PT_panel(bpy.types.Panel):
+    """BlenderBot main panel"""
+    bl_label = "BlenderBot"
+    bl_idname = "BLENDERBOT_PT_panel"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "BlenderBot"
+
+    def draw(self, context):
+        layout = self.layout
+        prefs = context.preferences.addons[__name__].preferences
+        running = getattr(context.scene, "blenderbot_running", False)
+
+        # Server controls
+        box = layout.box()
+        box.label(text="Server", icon="WORLD")
+        row = box.row()
+        row.label(text=f"{prefs.host}:{prefs.port}")
+
+        if running:
+            row = box.row()
+            row.scale_y = 1.5
+            row.operator("blenderbot.stop_server", icon="PAUSE")
+            box.label(text="Status: Running", icon="CHECKMARK")
+        else:
+            row = box.row()
+            row.scale_y = 1.5
+            row.operator("blenderbot.start_server", icon="PLAY")
+            box.label(text="Status: Stopped", icon="X")
+
+        # Tool modules info
+        box = layout.box()
+        box.label(text="Available Tools", icon="TOOL_SETTINGS")
+        from .tools import get_all_tool_definitions
+        tools = get_all_tool_definitions()
+        box.label(text=f"{len(tools)} tools loaded")
+
+        # Group by package
+        from .tools.base import ToolsPackageBase
+        for pkg in ToolsPackageBase.get_all_packages():
+            pkg_tools = pkg.get_all_tools()
+            if pkg_tools:
+                row = box.row()
+                row.label(text=f"  {pkg.__name__}: {len(pkg_tools)} tools", icon="DOT")
+
+
+class BlenderBotPreferences(bpy.types.AddonPreferences):
+    bl_idname = __name__
+
+    host: bpy.props.StringProperty(
+        name="Host", default=DEFAULT_HOST,
+        description="Server host address",
+    )
+    port: bpy.props.IntProperty(
+        name="Port", default=DEFAULT_PORT,
+        min=1024, max=65535,
+        description="Server port",
+    )
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "host")
+        layout.prop(self, "port")
 
 
 _classes = (
@@ -317,6 +366,7 @@ def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.blenderbot_running = bpy.props.BoolProperty(default=False)
+    Timer.register()
 
 
 def unregister():
@@ -324,6 +374,7 @@ def unregister():
     if _server:
         _server.stop()
         _server = None
+    Timer.unregister()
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
     if hasattr(bpy.types.Scene, "blenderbot_running"):
