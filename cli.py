@@ -84,15 +84,36 @@ def main():
         mode=args.mode,
     )
 
+    try:
+        _run_command(args, bot)
+    except (ConnectionRefusedError, ConnectionError, OSError) as e:
+        print(f"Error: Cannot connect to Blender at {args.host}:{args.port}")
+        print()
+        print("Make sure Blender is running with the addon server started:")
+        print("  1. Open Blender (or run: blender --background --python-expr \"...\")")
+        print("  2. Enable the BlenderBot addon")
+        print("  3. Start the server (Sidebar > BlenderBot > Start)")
+        print()
+        print("For headless mode:")
+        print("  blender --background --python-expr \"import bpy, time; "
+              "bpy.ops.preferences.addon_enable(module='blenderbot_addon'); "
+              "bpy.ops.blenderbot.start_server(); [time.sleep(1) for _ in iter(int, 1)]\" &")
+        sys.exit(1)
+    except TypeError as e:
+        if "api_key" in str(e) or "authentication" in str(e).lower():
+            print("Error: Anthropic API key not set.")
+            print("  export ANTHROPIC_API_KEY='your-key-here'")
+            print("  or use: python cli.py --api-key YOUR_KEY text \"...\"")
+            sys.exit(1)
+        raise
+
+
+def _run_command(args, bot: BlenderBot):
     if args.command == "ping":
         if bot.is_blender_connected():
             print("Blender is connected and ready!")
         else:
-            print("Cannot reach Blender. Make sure:")
-            print("  1. Blender is running")
-            print("  2. The BlenderBot addon is installed and enabled")
-            print("  3. The server is started (Sidebar > BlenderBot > Start)")
-            sys.exit(1)
+            raise ConnectionRefusedError("Blender server not reachable")
 
     elif args.command == "tools":
         tools = bot.blender.get_tools()

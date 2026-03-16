@@ -27,6 +27,12 @@ all = [
 blenderbot = "cli:main"
 blenderbot-telegram = "blenderbot.telegram_bot:main"
 
+[tool.setuptools.packages.find]
+include = ["blenderbot*"]
+
+[tool.setuptools]
+py-modules = ["cli"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"
